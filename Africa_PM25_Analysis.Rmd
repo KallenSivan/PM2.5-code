@@ -1,0 +1,399 @@
+---
+title: "Reproducible R analyses of PM2.5 in Africa, 1998-2023"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: show
+params:
+  data_file: "data/pm2.5 final data_with_area.csv"
+  output_dir: "results"
+  energy_forest_divisor: 100000000
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = TRUE, error = FALSE,
+                     fig.width = 9, fig.height = 6)
+required_packages <- c("dplyr", "tidyr", "ggplot2", "mice", "sandwich",
+                       "lmtest", "fixest", "geosphere", "xgboost",
+                       "SHAPforxgboost", "patchwork", "ggforce")
+missing_packages <- required_packages[
+  !vapply(required_packages, requireNamespace, logical(1), quietly = TRUE)
+]
+if (length(missing_packages)) {
+  stop("Install required packages: ", paste(missing_packages, collapse = ", "))
+}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+out_dir <- params$output_dir
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+knitr::opts_chunk$set(fig.path = paste0(gsub("\\\\", "/", out_dir), "/knitr_figures/"))
+save_table <- function(x, name) {
+  write.csv(x, file.path(out_dir, paste0(name, ".csv")), row.names = FALSE)
+}
+save_plot <- function(p, name, width = 9, height = 6) {
+  ggsave(file.path(out_dir, paste0(name, ".png")), p,
+         width = width, height = height, dpi = 300, bg = "white")
+  ggsave(file.path(out_dir, paste0(name, ".pdf")), p,
+         width = width, height = height)
+}
+safe_name <- function(x) gsub("[^A-Za-z0-9]+", "_", x)
+```
+
+## Data preparation
+
+```{r prepare-panel}
+panel <- read.csv(params$data_file, stringsAsFactors = FALSE, check.names = FALSE)
+analysis_vars <- c("WS", "WD", "Precipitation", "AT", "RH", "PGR", "UP",
+                   "FA", "EI", "TO", "LE", "Violence", "pGDP", "PM2.5")
+violence_types <- c("Violence", "violence_type1_count", "violence_type2_count",
+                    "violence_type3_count")
+needed <- c("country", "year", "area", "longitude", "latitude",
+            analysis_vars, violence_types)
+absent <- setdiff(needed, names(panel))
+if (length(absent)) stop("Missing columns: ", paste(absent, collapse = ", "))
+numeric_vars <- unique(c("year", "longitude", "latitude", analysis_vars,
+                         violence_types))
+for (v in numeric_vars) {
+  original <- panel[[v]]
+  panel[[v]] <- as.numeric(original)
+  if (any(is.na(panel[[v]]) & !is.na(original))) {
+    stop("Non-numeric values in column: ", v)
+  }
+}
+if (anyNA(panel[c("country", "year", "area")]) ||
+    any(panel$country == "") || any(panel$area == "")) {
+  stop("Country, year, and area identifiers must be complete.")
+}
+if (anyDuplicated(panel[c("country", "year")])) stop("Duplicate country-year rows.")
+if (any(!panel$year %in% 1998:2023)) stop("Expected study years: 1998-2023.")
+years_by_country <- split(panel$year, panel$country)
+if (!all(vapply(years_by_country, function(x) identical(sort(x), as.numeric(1998:2023)),
+                logical(1)))) {
+  stop("A complete annual panel is required for within-country time-order trends.")
+}
+regions <- c("Central Africa", "East Africa", "North Africa", "Southern Africa",
+             "West Africa")
+if (!setequal(unique(panel$area), regions)) stop("Unexpected regional labels.")
+if (any(vapply(split(panel$area, panel$country), function(x) length(unique(x)) != 1L,
+               logical(1)))) stop("A country has multiple regional labels.")
+missing_before <- data.frame(variable = analysis_vars,
+                             n_missing = colSums(is.na(panel[analysis_vars])))
+save_table(missing_before, "missingness_before_imputation")
+if (anyNA(panel[analysis_vars])) {
+  imputed <- mice::mice(panel[analysis_vars], m = 5, maxit = 5,
+                        seed = 1234, printFlag = FALSE)
+  panel[analysis_vars] <- mice::complete(imputed, 3)
+  saveRDS(imputed, file.path(out_dir, "imputation_model.rds"))
+}
+if (any(!is.finite(as.matrix(panel[analysis_vars])))) {
+  stop("Analysis variables still contain missing or non-finite values.")
+}
+if (any(panel$PM2.5 <= 0 | panel$pGDP <= 0 | panel$FA <= 0 |
+        panel$EI <= -1 | panel$AT <= -273.15)) stop("Invalid log-transform inputs.")
+if (anyNA(panel[violence_types]) || any(as.matrix(panel[violence_types]) < 0)) {
+  stop("Violence counts must be observed and non-negative.")
+}
+
+# Preserve the source definition: country maximum versus positive-value median.
+classify_violence <- function(df, variable) {
+  values <- df[[variable]]
+  cutoff <- median(values[values > 0], na.rm = TRUE)
+  if (!is.finite(cutoff)) stop("No positive violence counts for ", variable)
+  groups <- df %>%
+    group_by(country) %>%
+    summarise(max_violence = max(.data[[variable]]), .groups = "drop") %>%
+    mutate(violence_group = ifelse(max_violence > cutoff,
+                                  "More violence-affected", "Less violence-affected"),
+           threshold = cutoff)
+  save_table(groups, paste0("country_groups_", variable))
+  left_join(df %>% select(-any_of(c("violence_group", "threshold", "max_violence"))),
+            groups, by = "country")
+}
+panel <- classify_violence(panel, "Violence")
+save_table(panel, "analysis_panel_unscaled")
+panel <- panel %>% group_by(country) %>% arrange(year, .by_group = TRUE) %>%
+  mutate(time_order = row_number()) %>% ungroup()
+print(panel %>% distinct(country, area, violence_group) %>% count(area, violence_group))
+```
+
+## Observed, meteorological, and residual trends
+
+```{r trend-decomposition}
+trend_decomposition <- function(df, label) {
+  met <- lm(PM2.5 ~ WS + WD + Precipitation + AT + RH, data = df)
+  df$meteorological <- predict(met, newdata = df)
+  df$anthropogenic <- df$PM2.5 - df$meteorological
+  components <- c(Observed = "PM2.5", Meteorological = "meteorological",
+                  Anthropogenic = "anthropogenic")
+  ans <- bind_rows(lapply(names(components), function(component) {
+    model <- lm(reformulate("time_order", response = components[[component]]), data = df)
+    z <- coef(summary(model))["time_order", ]
+    data.frame(Group = label, Component = component, Estimate = unname(z[1]),
+               SE = unname(z[2]), P_value = unname(z[4]), N = nobs(model),
+               Countries = n_distinct(df$country))
+  }))
+  total <- ans$Estimate[ans$Component == "Observed"]
+  ans$Share_percent <- if (abs(total) > 1e-12) 100 * ans$Estimate / total else NA_real_
+  stopifnot(abs(ans$Estimate[1] - sum(ans$Estimate[2:3])) < 1e-8)
+  ans
+}
+trend_groups <- c(list(Africa = panel), split(panel, panel$area),
+                  split(panel, panel$violence_group))
+trend_results <- bind_rows(lapply(names(trend_groups), function(g) {
+  trend_decomposition(trend_groups[[g]], g)
+}))
+country_trends <- bind_rows(lapply(split(panel, panel$country), function(df) {
+  trend_decomposition(df, df$country[1])
+}))
+save_table(trend_results, "trend_decomposition_groups")
+save_table(country_trends, "trend_decomposition_countries")
+trend_display <- trend_results %>%
+  mutate(stars = case_when(P_value < 0.001 ~ "***", P_value < 0.01 ~ "**",
+                           P_value < 0.05 ~ "*", P_value < 0.1 ~ ".", TRUE ~ ""),
+         Value = paste0(sprintf("%.3f", Estimate), stars)) %>%
+  select(Group, Component, Value) %>% pivot_wider(names_from = Component, values_from = Value)
+print(trend_display)
+save_table(trend_display, "trend_decomposition_formatted")
+```
+
+## XGBoost and SHAP
+
+```{r xgboost-performance}
+# Restore the input row order for the source's random train/test split.
+shap_data <- read.csv(params$data_file, stringsAsFactors = FALSE)
+row_key <- paste(shap_data$country, shap_data$year)
+shap_data <- panel[match(row_key, paste(panel$country, panel$year)), ]
+shap_data$FA <- shap_data$FA / 10000
+features <- setdiff(analysis_vars, "PM2.5")
+xgb_params <- list(objective = "reg:squarederror", booster = "gbtree", eta = 0.05,
+                   max_depth = 8, subsample = 0.7, colsample_bytree = 0.7)
+fit_xgb <- function(X, y) {
+  set.seed(42)
+  xgboost::xgb.train(params = xgb_params,
+                     data = xgboost::xgb.DMatrix(as.matrix(X), label = y),
+                     nrounds = 150, verbose = 0)
+}
+set.seed(123)
+train_index <- sample(seq_len(nrow(shap_data)), size = 0.8 * nrow(shap_data))
+holdout_model <- fit_xgb(shap_data[train_index, features], shap_data$PM2.5[train_index])
+test_y <- shap_data$PM2.5[-train_index]
+test_pred <- predict(holdout_model,
+                      xgboost::xgb.DMatrix(as.matrix(shap_data[-train_index, features])))
+performance <- data.frame(
+  Metric = c("Squared Pearson correlation", "Predictive R2", "RMSE", "MAE"),
+  Value = c(cor(test_y, test_pred)^2,
+            1 - sum((test_y - test_pred)^2) / sum((test_y - mean(test_y))^2),
+            sqrt(mean((test_y - test_pred)^2)), mean(abs(test_y - test_pred)))
+)
+print(performance)
+save_table(performance, "XGBoost_holdout_performance")
+save_table(data.frame(country = shap_data$country, year = shap_data$year,
+                      sample = ifelse(seq_len(nrow(shap_data)) %in% train_index,
+                                      "Training", "Test")), "XGBoost_split")
+```
+
+```{r shap-models, fig.height=8}
+shap_analysis <- function(df, label, predictors) {
+  X <- as.matrix(df[, predictors])
+  model <- fit_xgb(X, df$PM2.5)
+  shap_values <- SHAPforxgboost::shap.values(xgb_model = model, X_train = X)
+  importance <- data.frame(Feature = names(shap_values$mean_shap_score),
+                            Mean_absolute_SHAP = as.numeric(shap_values$mean_shap_score))
+  save_table(importance, paste0("SHAP_importance_", safe_name(label)))
+  save_table(cbind(df[c("country", "year")], as.data.frame(shap_values$shap_score)),
+              paste0("SHAP_values_", safe_name(label)))
+  shap_long <- SHAPforxgboost::shap.prep(xgb_model = model, X_train = X)
+  # Draw the source-style summary without a package-level global label variable.
+  p <- ggplot(shap_long, aes(variable, value)) +
+    geom_hline(yintercept = 0, color = "grey60") +
+    ggforce::geom_sina(aes(color = stdfvalue), method = "counts", maxwidth = 0.7,
+                       alpha = 0.7) +
+    scale_x_discrete(limits = rev(levels(shap_long$variable))) +
+    scale_color_gradient(low = "#FFCC33", high = "#6600CC",
+                          breaks = c(0, 1), labels = c("Low", "High")) +
+    coord_flip() + theme_bw(base_size = 12) +
+    labs(title = label, x = NULL, y = "SHAP value (impact on model output)",
+         color = "Feature value") + theme(legend.position = "bottom")
+  save_plot(p, paste0("SHAP_", safe_name(label)), height = 8)
+  p
+}
+shap_plots <- list()
+for (region in regions) {
+  shap_plots[[region]] <- shap_analysis(filter(shap_data, area == region), region, features)
+}
+for (group in c("More violence-affected", "Less violence-affected")) {
+  shap_plots[[group]] <- shap_analysis(filter(shap_data, violence_group == group),
+                                      group, setdiff(features, "Violence"))
+}
+figure2 <- patchwork::wrap_plots(shap_plots[c("More violence-affected",
+                                              "Less violence-affected")], ncol = 2) +
+  patchwork::plot_annotation(tag_levels = "a")
+print(figure2)
+save_plot(figure2, "Figure_2_SHAP_violence", width = 16, height = 8)
+regional_shap <- patchwork::wrap_plots(shap_plots[regions], ncol = 3) +
+  patchwork::plot_annotation(tag_levels = "a")
+save_plot(regional_shap, "SHAP_regions", width = 20, height = 13)
+```
+
+## Environmental Kuznets curves
+
+
+```{r ekc-functions}
+ekc_data <- panel %>% mutate(lPM25 = log(PM2.5), lgdp = log(pGDP), lgdp2 = lgdp^2,
+                             lFA = log(FA / 10000), lEI = log1p(EI),
+                             lAT = log(AT + 273.15))
+ekc_formula <- lPM25 ~ lgdp + lgdp2 + lFA + lEI + lAT
+coefficient_table <- function(model, label, robust = FALSE) {
+  tab <- if (robust) lmtest::coeftest(model, vcov. = sandwich::vcovHC(model, type = "HC1"))
+         else coef(summary(model))
+  data.frame(Group = label, Term = rownames(tab), Estimate = tab[, 1],
+             SE = tab[, 2], Statistic = tab[, 3], P_value = tab[, 4],
+             N = nobs(model), R2 = summary(model)$r.squared,
+             Adjusted_R2 = summary(model)$adj.r.squared, row.names = NULL)
+}
+turning_point <- function(model, df, label) {
+  b <- coef(model)
+  tp <- if (is.finite(b["lgdp2"]) && abs(b["lgdp2"]) > 1e-12)
+    exp(-b["lgdp"] / (2 * b["lgdp2"])) else NA_real_
+  gdp2023 <- df %>% filter(year == 2023) %>% group_by(country) %>%
+    summarise(gdp = mean(pGDP), .groups = "drop")
+  data.frame(Group = label, Turning_point_USD = unname(tp),
+             Inverted_U = unname(b["lgdp2"] < 0),
+             Within_sample_range = is.finite(tp) && tp >= min(df$pGDP) && tp <= max(df$pGDP),
+             Mean_GDP_2023 = mean(gdp2023$gdp), Median_GDP_2023 = median(gdp2023$gdp))
+}
+prediction_grid <- function(model, df, label, grid) {
+  nd <- data.frame(lgdp = log(grid), lgdp2 = log(grid)^2,
+                   lFA = mean(df$lFA), lEI = mean(df$lEI), lAT = mean(df$lAT))
+  data.frame(GDP = grid, PM25 = exp(predict(model, newdata = nd)), Group = label)
+}
+ekc_colors <- c("Africa" = "#2C7FB8", "More violence-affected" = "#D95F02",
+                "Less violence-affected" = "#1B9E77")
+run_ekc <- function(variable) {
+  df <- classify_violence(ekc_data, variable)
+  subsets <- c(list(Africa = df), split(df, df$violence_group))
+  models <- lapply(subsets, function(x) lm(ekc_formula, data = x))
+  turning <- bind_rows(lapply(names(models), function(g) turning_point(models[[g]], subsets[[g]], g)))
+  turning$Mean_to_turning_ratio <- turning$Mean_GDP_2023 / turning$Turning_point_USD
+  turning$Median_to_turning_ratio <- turning$Median_GDP_2023 / turning$Turning_point_USD
+  for (robust in c(FALSE, TRUE)) {
+    tab <- bind_rows(lapply(names(models), function(g) coefficient_table(models[[g]], g, robust)))
+    save_table(tab, paste0("EKC_coefficients_", variable, if (robust) "_HC1" else "_OLS"))
+  }
+  save_table(turning, paste0("EKC_turning_points_", variable))
+  grid <- seq(min(df$pGDP), quantile(df$pGDP, 0.8), length.out = 300)
+  predictions <- bind_rows(lapply(names(models), function(g) {
+    prediction_grid(models[[g]], subsets[[g]], g, grid)
+  }))
+  save_table(predictions, paste0("EKC_predictions_", variable))
+  p <- ggplot(predictions, aes(GDP, PM25, color = Group)) +
+    geom_line(linewidth = 1.2) +
+    geom_vline(data = turning, aes(xintercept = Median_GDP_2023, color = Group),
+               linetype = "dashed", show.legend = FALSE) +
+    scale_color_manual(values = ekc_colors) +
+    labs(x = "GDP per capita (USD)", y = expression(PM[2.5]~(mu*g/m^3)), color = NULL) +
+    theme_classic(base_size = 12) + theme(legend.position = "bottom")
+  save_plot(p, paste0("EKC_", variable))
+  list(models = models, turning = turning, plot = p)
+}
+```
+
+```{r ekc-results, fig.width=14, fig.height=10}
+ekc_results <- setNames(lapply(violence_types, run_ekc), violence_types)
+print(ekc_results$Violence$turning)
+figure3 <- patchwork::wrap_plots(lapply(ekc_results, `[[`, "plot"), ncol = 2,
+                                 guides = "collect") +
+  patchwork::plot_annotation(tag_levels = "a")
+figure3 <- figure3 & theme(legend.position = "bottom")
+print(figure3)
+save_plot(figure3, "Figure_3_EKC", width = 14, height = 10)
+```
+
+## External energy shock exposure
+
+```{r energy-index}
+if (any(!is.finite(as.matrix(panel[c("longitude", "latitude")])))) {
+  stop("Coordinates are required for the energy shock index.")
+}
+oil <- data.frame(
+  year = 1997:2023,
+  price = c(17.23, 10.87, 15.56, 26.72, 21.84, 22.51, 27.56, 36.77, 50.28,
+            59.69, 66.52, 94.04, 56.35, 74.71, 95.73, 94.52, 95.99, 87.39,
+            44.39, 38.29, 48.05, 61.4, 55.59, 36.86, 65.84, 93.97, 76.1)
+)
+oil$shock <- c(NA_real_, diff(log(oil$price)))
+energy_data <- left_join(panel, oil[c("year", "shock")], by = "year")
+energy_data$distance_hormuz <- geosphere::distHaversine(
+  cbind(energy_data$longitude, energy_data$latitude), c(56.14, 26.33)) / 1000
+if (any(energy_data$distance_hormuz <= 0)) stop("Non-positive distance to Hormuz.")
+energy_data <- energy_data %>% mutate(exposure = 1 / sqrt(distance_hormuz),
+                                     IV = exposure * shock)
+if (any(!is.finite(energy_data$IV))) stop("Energy shock index is incomplete.")
+save_table(oil, "annual_oil_prices_and_shocks")
+save_table(energy_data, "energy_shock_panel_unscaled")
+```
+
+### Country and year fixed effects by violence group
+
+```{r energy-fixed-effects}
+# Scale forest area once, as in the source data_with_IV.csv used for Table 2.
+energy_fe <- energy_data %>% mutate(lPM25 = log(PM2.5), lpGDP = log(pGDP), FA = FA / 10000)
+fe_models <- lapply(split(energy_fe, energy_fe$violence_group), function(df) {
+  fixest::feols(lPM25 ~ IV + lpGDP + AT + FA + EI | country + year,
+                data = df, cluster = ~country)
+})
+fe_coefficients <- bind_rows(lapply(names(fe_models), function(g) {
+  m <- fe_models[[g]]
+  z <- fixest::coeftable(m)
+  data.frame(Group = g, Term = rownames(z), Estimate = z[, 1], SE = z[, 2],
+             Statistic = z[, 3], P_value = z[, 4], N = nobs(m),
+             Adjusted_R2 = as.numeric(fixest::fitstat(m, "ar2")[[1]]), row.names = NULL)
+}))
+print(fe_coefficients)
+save_table(fe_coefficients, "Table_2_energy_shock_fixed_effects")
+```
+
+### EKCs by energy shock exposure
+
+```{r energy-ekc}
+# Retain the cumulative forest-area scaling used in the reported robustness result.
+stopifnot(is.finite(params$energy_forest_divisor), params$energy_forest_divisor > 0)
+energy_ekc <- energy_data %>%
+  mutate(lPM25 = log(PM2.5), lgdp = log(pGDP), lgdp2 = lgdp^2,
+         lFA = log1p(FA / params$energy_forest_divisor),
+         lEI = log1p(EI), lAT = log(AT + 273.15), IV_std = as.numeric(scale(IV)))
+energy_ekc <- energy_ekc %>%
+  mutate(energy_group = ifelse(IV_std <= median(IV_std), "Low exposure", "High exposure"))
+energy_subsets <- split(energy_ekc, energy_ekc$energy_group)
+energy_models <- lapply(energy_subsets, function(df) lm(ekc_formula, data = df))
+energy_turning <- bind_rows(lapply(names(energy_models), function(g) {
+  turning_point(energy_models[[g]], energy_subsets[[g]], g)
+})) %>% select(Group, Turning_point_USD, Inverted_U, Within_sample_range)
+energy_coefficients <- bind_rows(lapply(names(energy_models), function(g) {
+  coefficient_table(energy_models[[g]], g)
+}))
+print(energy_turning)
+save_table(energy_turning, "energy_EKC_turning_points")
+save_table(energy_coefficients, "energy_EKC_coefficients")
+save_table(energy_ekc %>% select(country, year, IV, IV_std, energy_group),
+              "energy_exposure_groups")
+energy_grid <- seq(min(energy_ekc$pGDP), quantile(energy_ekc$pGDP, 0.8), length.out = 400)
+energy_predictions <- bind_rows(lapply(names(energy_models), function(g) {
+  prediction_grid(energy_models[[g]], energy_subsets[[g]], g, energy_grid)
+}))
+visible_turning <- energy_turning %>%
+  filter(is.finite(Turning_point_USD), Turning_point_USD >= min(energy_grid),
+         Turning_point_USD <= max(energy_grid))
+energy_plot <- ggplot(energy_predictions, aes(GDP, PM25, color = Group)) +
+  geom_line(linewidth = 1.2) +
+  geom_vline(data = visible_turning, aes(xintercept = Turning_point_USD, color = Group),
+             linetype = "dashed", show.legend = FALSE) +
+  scale_color_manual(values = c("Low exposure" = "#1B9E77", "High exposure" = "#D95F02")) +
+  labs(x = "GDP per capita (USD)", y = expression(PM[2.5]~(mu*g/m^3)),
+       color = "Energy shock exposure") +
+  theme_classic(base_size = 12) + theme(legend.position = "bottom")
+print(energy_plot)
+save_plot(energy_plot, "Figure_S6_energy_exposure_EKC")
+save_table(energy_predictions, "energy_EKC_predictions")
+```
